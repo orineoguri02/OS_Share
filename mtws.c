@@ -22,12 +22,21 @@ static pthread_mutex_t total_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int total_count = 0;
 static char *search_word = NULL;
 
-// helper prototypes
+// 도움말 출력 매크로
+#define USAGE_MSG() do { \
+    fprintf(stderr, "Usage: %s -b <buffer size> -t <num threads> -d <directory> -w <word>\n", argv[0]); \
+    fprintf(stderr, "  -b : bounded buffer size\n"); \
+    fprintf(stderr, "  -t : number of threads searching word (except for main thread)\n"); \
+    fprintf(stderr, "  -d : search directory (includes subdirectories)\n"); \
+    fprintf(stderr, "  -w : search word (case-insensitive)\n"); \
+} while(0)
+
+// 프로토타입
 void to_lower_str(char *s);
 int is_text_file(const char *name);
 void *worker(void *arg);
 
-// initialize bounded buffer
+// 버퍼 초기화
 void buf_init(buffer_t *b, int capacity) {
     b->capacity = capacity;
     b->count = b->head = b->tail = 0;
@@ -37,7 +46,7 @@ void buf_init(buffer_t *b, int capacity) {
     pthread_cond_init(&b->not_full, NULL);
 }
 
-// destroy buffer
+// 버퍼 해제
 void buf_destroy(buffer_t *b) {
     free(b->buf);
     pthread_mutex_destroy(&b->mtx);
@@ -45,7 +54,7 @@ void buf_destroy(buffer_t *b) {
     pthread_cond_destroy(&b->not_full);
 }
 
-// push an item into the buffer (blocks if full)
+// push (block if full)
 void buf_push(buffer_t *b, char *item) {
     pthread_mutex_lock(&b->mtx);
     while (b->count == b->capacity)
@@ -57,8 +66,7 @@ void buf_push(buffer_t *b, char *item) {
     pthread_mutex_unlock(&b->mtx);
 }
 
-// pop an item from the buffer (blocks if empty)
-// returns NULL when no more items will arrive
+// pop (block if empty; NULL on completion)
 char *buf_pop(buffer_t *b) {
     pthread_mutex_lock(&b->mtx);
     while (b->count == 0 && !producers_done)
@@ -75,128 +83,124 @@ char *buf_pop(buffer_t *b) {
     return item;
 }
 
-// convert string in-place to lowercase
+// 문자열을 소문자로
 void to_lower_str(char *s) {
     for (; *s; ++s) *s = tolower((unsigned char)*s);
 }
 
-// filter: only .txt, .c, .h files
+// 텍스트 파일 필터링(.txt, .c, .h)
 int is_text_file(const char *name) {
     const char *ext = strrchr(name, '.');
     if (!ext) return 0;
-    return strcmp(ext, ".txt") == 0
-        || strcmp(ext, ".c")   == 0
-        || strcmp(ext, ".h")   == 0;
+    return strcmp(ext, ".txt")==0
+        || strcmp(ext, ".c")==0
+        || strcmp(ext, ".h")==0;
 }
 
-// recursively traverse directories, push each matching file path
+// 디렉터리 재귀 탐색 → buf_push
 void traverse_dir(const char *dirpath) {
     DIR *dir = opendir(dirpath);
     if (!dir) return;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        // skip hidden files/dirs
-        if (entry->d_name[0] == '.') continue;
-
+        if (entry->d_name[0]=='.') continue;  // 숨김 건너뛰기
         char path[PATH_MAX];
         snprintf(path, PATH_MAX, "%s/%s", dirpath, entry->d_name);
         struct stat st;
-        if (stat(path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
+        if (stat(path, &st)==0) {
+            if (S_ISDIR(st.st_mode))
                 traverse_dir(path);
-            } else if (S_ISREG(st.st_mode) && is_text_file(entry->d_name)) {
+            else if (S_ISREG(st.st_mode) && is_text_file(entry->d_name))
                 buf_push(&buffer, strdup(path));
-            }
         }
     }
     closedir(dir);
 }
 
-// worker thread: pop paths, search word, report count
+// 워커 스레드: buf_pop → 검색 → 개수 합산 → 출력
 void *worker(void *arg) {
     (void)arg;
     while (1) {
         char *path = buf_pop(&buffer);
         if (!path) break;
         FILE *fp = fopen(path, "r");
-        if (!fp) {
-            free(path);
-            continue;
-        }
-        size_t len = 0;
-        char *line = NULL;
-        int local_count = 0;
-        char *lower_word = strdup(search_word);
-        to_lower_str(lower_word);
-
-        while (getline(&line, &len, fp) != -1) {
-            char *lcopy = strdup(line);
-            to_lower_str(lcopy);
-            char *p = lcopy;
-            while ((p = strstr(p, lower_word)) != NULL) {
-                local_count++;
-                p += strlen(lower_word);
+        if (fp) {
+            size_t len = 0;
+            char *line = NULL;
+            int local_count = 0;
+            char *lower_word = strdup(search_word);
+            to_lower_str(lower_word);
+            while (getline(&line, &len, fp) != -1) {
+                char *dup = strdup(line);
+                to_lower_str(dup);
+                char *p = dup;
+                while ((p = strstr(p, lower_word)) != NULL) {
+                    local_count++;
+                    p += strlen(lower_word);
+                }
+                free(dup);
             }
-            free(lcopy);
+            free(line);
+            free(lower_word);
+            fclose(fp);
+            printf("[Thread %lu] %s: %d found\n",
+                   (unsigned long)pthread_self(), path, local_count);
+            pthread_mutex_lock(&total_mtx);
+            total_count += local_count;
+            pthread_mutex_unlock(&total_mtx);
         }
-
-        free(lower_word);
-        free(line);
-        fclose(fp);
-
-        printf("[thread %lu] %s: %d found\n",
-               (unsigned long)pthread_self(), path, local_count);
-
-        pthread_mutex_lock(&total_mtx);
-        total_count += local_count;
-        pthread_mutex_unlock(&total_mtx);
-
         free(path);
     }
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    int bufsize = 0, num_threads = 0;
-    char *dirpath = NULL;
+    int bufsize=0, num_threads=0;
+    char *dirpath=NULL;
     int opt;
+
+    // 옵션 파싱
     while ((opt = getopt(argc, argv, "b:t:d:w:")) != -1) {
         switch (opt) {
-        case 'b': bufsize      = atoi(optarg);   break;
-        case 't': num_threads  = atoi(optarg);   break;
-        case 'd': dirpath      = strdup(optarg); break;
-        case 'w': search_word  = strdup(optarg); break;
-        default:
-            fprintf(stderr, "Usage: %s -b <bufsize> -t <threads> -d <dir> -w <word>\n", argv[0]);
-            exit(EXIT_FAILURE);
+            case 'b': bufsize     = atoi(optarg);   break;
+            case 't': num_threads = atoi(optarg);   break;
+            case 'd': dirpath     = strdup(optarg); break;
+            case 'w': search_word = strdup(optarg); break;
+            default:
+                USAGE_MSG();
+                exit(EXIT_FAILURE);
         }
     }
     if (!bufsize || !num_threads || !dirpath || !search_word) {
-        fprintf(stderr, "Missing required argument\n");
+        USAGE_MSG();
         exit(EXIT_FAILURE);
     }
 
     buf_init(&buffer, bufsize);
 
-    pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
-    for (int i = 0; i < num_threads; i++) {
-        if (pthread_create(&threads[i], NULL, worker, NULL) != 0) {
+    // 워커 스레드 생성
+    pthread_t *threads = malloc(sizeof(pthread_t)*num_threads);
+    for (int i=0; i<num_threads; i++) {
+        if (pthread_create(&threads[i], NULL, worker, NULL)!=0) {
             perror("pthread_create");
             exit(EXIT_FAILURE);
         }
     }
 
+    // 메인 스레드가 디렉터리 탐색
     traverse_dir(dirpath);
 
-    // signal consumers that production is done
+    // 종료 신호
     pthread_mutex_lock(&buffer.mtx);
     producers_done = 1;
     pthread_cond_broadcast(&buffer.not_empty);
     pthread_mutex_unlock(&buffer.mtx);
 
-    for (int i = 0; i < num_threads; i++)
+    // 워커 종료 대기
+    for (int i=0; i<num_threads; i++)
         pthread_join(threads[i], NULL);
 
+    // 최종 합계 출력
     printf("Total found = %d\n", total_count);
 
     buf_destroy(&buffer);

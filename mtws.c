@@ -24,6 +24,7 @@ static char *search_word = NULL;
 
 // helper prototypes
 void to_lower_str(char *s);
+int is_text_file(const char *name);
 void *worker(void *arg);
 
 // initialize bounded buffer
@@ -74,31 +75,41 @@ char *buf_pop(buffer_t *b) {
     return item;
 }
 
-// recursively traverse directories, push each file path
+// convert string in-place to lowercase
+void to_lower_str(char *s) {
+    for (; *s; ++s) *s = tolower((unsigned char)*s);
+}
+
+// filter: only .txt, .c, .h files
+int is_text_file(const char *name) {
+    const char *ext = strrchr(name, '.');
+    if (!ext) return 0;
+    return strcmp(ext, ".txt") == 0
+        || strcmp(ext, ".c")   == 0
+        || strcmp(ext, ".h")   == 0;
+}
+
+// recursively traverse directories, push each matching file path
 void traverse_dir(const char *dirpath) {
     DIR *dir = opendir(dirpath);
     if (!dir) return;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".")==0 || strcmp(entry->d_name, "..")==0)
-            continue;
+        // skip hidden files/dirs
+        if (entry->d_name[0] == '.') continue;
+
         char path[PATH_MAX];
         snprintf(path, PATH_MAX, "%s/%s", dirpath, entry->d_name);
         struct stat st;
-        if (stat(path, &st)==0) {
+        if (stat(path, &st) == 0) {
             if (S_ISDIR(st.st_mode)) {
                 traverse_dir(path);
-            } else if (S_ISREG(st.st_mode)) {
+            } else if (S_ISREG(st.st_mode) && is_text_file(entry->d_name)) {
                 buf_push(&buffer, strdup(path));
             }
         }
     }
     closedir(dir);
-}
-
-// convert string in-place to lowercase
-void to_lower_str(char *s) {
-    for (; *s; ++s) *s = tolower((unsigned char)*s);
 }
 
 // worker thread: pop paths, search word, report count
@@ -117,6 +128,7 @@ void *worker(void *arg) {
         int local_count = 0;
         char *lower_word = strdup(search_word);
         to_lower_str(lower_word);
+
         while (getline(&line, &len, fp) != -1) {
             char *lcopy = strdup(line);
             to_lower_str(lcopy);
@@ -127,6 +139,7 @@ void *worker(void *arg) {
             }
             free(lcopy);
         }
+
         free(lower_word);
         free(line);
         fclose(fp);
@@ -149,10 +162,10 @@ int main(int argc, char *argv[]) {
     int opt;
     while ((opt = getopt(argc, argv, "b:t:d:w:")) != -1) {
         switch (opt) {
-        case 'b': bufsize = atoi(optarg); break;
-        case 't': num_threads = atoi(optarg); break;
-        case 'd': dirpath = strdup(optarg); break;
-        case 'w': search_word = strdup(optarg); break;
+        case 'b': bufsize      = atoi(optarg);   break;
+        case 't': num_threads  = atoi(optarg);   break;
+        case 'd': dirpath      = strdup(optarg); break;
+        case 'w': search_word  = strdup(optarg); break;
         default:
             fprintf(stderr, "Usage: %s -b <bufsize> -t <threads> -d <dir> -w <word>\n", argv[0]);
             exit(EXIT_FAILURE);
@@ -175,14 +188,14 @@ int main(int argc, char *argv[]) {
 
     traverse_dir(dirpath);
 
+    // signal consumers that production is done
     pthread_mutex_lock(&buffer.mtx);
     producers_done = 1;
     pthread_cond_broadcast(&buffer.not_empty);
     pthread_mutex_unlock(&buffer.mtx);
 
-    for (int i = 0; i < num_threads; i++) {
+    for (int i = 0; i < num_threads; i++)
         pthread_join(threads[i], NULL);
-    }
 
     printf("Total found = %d\n", total_count);
 
